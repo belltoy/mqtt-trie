@@ -1,41 +1,44 @@
-use std::collections::{
-    HashMap,
-    hash_map::Iter,
-};
+use std::collections::HashMap;
 use std::iter::Peekable;
 use std::str::Split;
 
 const DELIMITER: char = '/';
-const SINGLE_LEVEL_WILDCARD: char = '+';
-const MULTI_LEVEL_WILDCARD: char = '#';
 const DOLLAR: char = '$';
+const SINGLE_LEVEL_WILDCARD: &str = "+";
+const MULTI_LEVEL_WILDCARD: &str = "#";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum Word {
+pub enum Word<T> {
     /// Single level wildcard
     Plus,
     /// Multi level wildcard
     Num,
     /// Regular level
-    Regular(String),
+    Regular(T),
 }
 
-// #[derive(Debug, Default, Clone, PartialEq, Eq)]
-type Children = HashMap<(Word, NodeType), Box<Node>>;
+type OwnedWord = Word<String>;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct OwnedKey {
+    word: OwnedWord,
+    node_type: NodeType,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum NodeType {
     Leaf,
     Branch,
 }
+impl Copy for NodeType {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Node {
     Leaf{
-        word: Word,
+        word: OwnedWord,
     },
     Branch{
-        word: Word,
+        word: OwnedWord,
         children: Children,
     },
 }
@@ -47,65 +50,173 @@ pub struct Trie {
     root: Children,
 }
 
-impl<'a> Iterator for ChildrenIter<'a> {
-    type Item = (&'a Word, &'a Node);
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct Children(HashMap<OwnedKey, Box<Node>>);
 
-    fn next(&mut self) -> Option<Self::Item> {
-        self.0.next().map(|((k, _), v)| (k, v.as_ref()))
+trait Key {
+    fn key(&self) -> (Word<&str>, NodeType);
+}
+
+impl Key for OwnedKey {
+    fn key(&self) -> (Word<&str>, NodeType) {
+        (self.word.as_ref(), self.node_type)
     }
 }
 
-impl<'a> Iterator for NodeIter<'a> {
-    type Item = (&'a Word, &'a Node);
+impl Key for (Word<&str>, NodeType) {
+    fn key(&self) -> (Word<&str>, NodeType) {
+        (self.0.clone(), self.1)
+    }
+}
 
-    fn next(&mut self) -> Option<Self::Item> {
+impl Key for (&str, NodeType) {
+    fn key(&self) -> (Word<&str>, NodeType) {
+        (Word::Regular(self.0), self.1)
+    }
+}
+
+impl<'a> std::borrow::Borrow<dyn Key + 'a> for OwnedKey {
+    fn borrow(&self) -> &(dyn Key + 'a) {
+        self
+    }
+}
+
+impl<'a> Eq for dyn Key + 'a {}
+impl<'a> PartialEq for dyn Key + 'a {
+    fn eq(&self, other: &Self) -> bool {
+        self.key() == other.key()
+    }
+}
+
+impl<'a> std::hash::Hash for dyn Key + 'a {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.key().hash(state);
+    }
+}
+
+impl Word<String> {
+    fn as_ref(&self) -> Word<&str> {
+        use Word::*;
         match self {
-            NodeIter::Leaf(mut node) => {
-                node.take().map(|node| (node.word(), node))
-            },
-            NodeIter::Branch(iter) => iter.next(),
+            Plus => Plus,
+            Num => Num,
+            Regular(s) => Regular(s.as_str()),
         }
     }
 }
 
-impl<T> From<T> for Word
+impl<T> From<T> for OwnedWord
 where
     T: AsRef<str>,
 {
     fn from(src: T) -> Self {
-        let s = src.as_ref();
-        match s.chars().next() {
-            Some(SINGLE_LEVEL_WILDCARD) => Word::Plus,
-            Some(MULTI_LEVEL_WILDCARD) => Word::Num,
-            _ => Word::Regular(s.to_string()),
+        match src.as_ref() {
+            SINGLE_LEVEL_WILDCARD => Word::Plus,
+            MULTI_LEVEL_WILDCARD => Word::Num,
+            _ => Word::Regular(src.as_ref().to_string()),
         }
     }
 }
 
-impl std::borrow::Borrow<str> for &Word {
-    fn borrow(&self) -> &str {
-        match self {
-            Word::Plus => "+",
-            Word::Num => "#",
-            Word::Regular(s) => s,
+struct ChildrenNodeMatcher<'a> {
+    word: &'a str,
+    end_of_topic: bool,
+    children: &'a Children,
+    search_type: NodeSearchType,
+}
+
+// The fixed search sequences for children nodes search.
+#[derive(Debug)]
+enum NodeSearchType {
+    // search node of number sign #
+    NumNode,
+    // search leaf node of plus sign +
+    PlusLeaf,
+    // search branch node of plus sign +
+    PlusBranch,
+    // search leaf node of regular word
+    RegularLeaf,
+    // search branch node of regular word
+    RegularBranch,
+    // End of search
+    End,
+}
+
+impl Children {
+    /// Search children nodes by word at the end of topic or at the middle level,
+    /// returns an iterator which may result in a number sign node wor pl1ug sign node.
+    fn search_node<'a, 'b>(&'a self, word: &'b str, end_of_topic: bool) -> ChildrenNodeMatcher<'b>
+    where
+        'a: 'b,
+    {
+        ChildrenNodeMatcher {
+            word,
+            end_of_topic,
+            children: self,
+            search_type: NodeSearchType::NumNode,
+        }
+    }
+}
+
+impl<'a> Iterator for ChildrenNodeMatcher<'a> {
+    type Item = &'a Node;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        use NodeSearchType::*;
+        use Word::*;
+        use NodeType::*;
+        let children = &self.children.0;
+        loop {
+            // Search children nodes in the fixed order.
+            let (rst, next) = if self.end_of_topic {
+                // For leaf nodes iteration
+                match &self.search_type {
+                    NumNode => {
+                        (children.get(&(Num, Leaf) as &dyn Key), PlusLeaf)
+                    }
+                    PlusLeaf => {
+                        (children.get(&(Plus, Leaf) as &dyn Key), RegularLeaf)
+                    }
+                    // NOTE: DON'T clone string, borrow it
+                    RegularLeaf => {
+                        let key = (self.word, Leaf);
+                        (children.get(&key as &dyn Key), End)
+                    }
+                    _ => {
+                        return None;
+                    }
+                }
+            } else {
+                // For branch nodes iteration
+                match &self.search_type {
+                    NumNode => {
+                        // NOTE: The number sign node is always at the leaf node
+                        (children.get(&(Num, Leaf) as &dyn Key), PlusBranch)
+                    }
+                    PlusBranch => {
+                        (children.get(&(Plus, Branch) as &dyn Key), RegularBranch)
+                    }
+                    // NOTE: DON'T clone string, borrow it
+                    RegularBranch => {
+                        let key = (self.word, Branch);
+                        (children.get(&key as &dyn Key), End)
+                    }
+                    _ => {
+                        return None;
+                    }
+                }
+            };
+
+            self.search_type = next;
+
+            if let Some(rst) = rst {
+                return Some(rst);
+            }
         }
     }
 }
 
 impl Node {
-    fn iter(&self) -> NodeIter<'_> {
-        match self {
-            Node::Leaf{..} => NodeIter::Leaf(Some(self)),
-            Node::Branch{children, ..} => NodeIter::Branch(ChildrenIter(children.iter())),
-        }
-    }
-
-    fn word(&self) -> &Word {
-        match self {
-            Node::Leaf{word, ..} => word,
-            Node::Branch{word, ..} => word,
-        }
-    }
 
     fn is_wildcard(&self) -> bool {
         match self {
@@ -113,21 +224,6 @@ impl Node {
             Node::Branch{word: Word::Plus | Word::Num, ..} => true,
             _ => false,
         }
-    }
-}
-
-impl<S> FromIterator<S> for Trie
-where
-    S: AsRef<str>,
-{
-    fn from_iter<T: IntoIterator<Item=S>>(iter: T) -> Self {
-        let mut trie = Trie::default();
-
-        for topic in iter.into_iter() {
-            trie.insert(topic.as_ref());
-        }
-
-        trie
     }
 }
 
@@ -145,9 +241,12 @@ impl Trie {
         while let Some(word) = words.next() {
             let is_branch = words.peek().is_some();
             let node_type = if is_branch { NodeType::Branch } else { NodeType::Leaf };
-            let key = (word.clone(), node_type);
+            let key = OwnedKey {
+                word: word.clone(),
+                node_type,
+            };
 
-            let child = current.entry(key).or_insert_with(|| {
+            let child = current.0.entry(key).or_insert_with(|| {
                 if is_branch {
                     Box::new(Node::Branch {
                         word,
@@ -183,12 +282,14 @@ impl Trie {
         'a: 'b,
     {
         let mut levels = topic.split(DELIMITER).peekable();
+        // split an empty string has at least one element
         let current_level = levels.next();
+        let end_of_topic = levels.peek().is_none();
         let inner = InnerMatcher {
             first_level: true,
             levels,
-            current_level,
-            children: NodeIter::Branch(ChildrenIter(self.root.iter())),
+            current_level: current_level.clone(),
+            children: self.root.search_node(current_level.unwrap(), end_of_topic),
         };
 
         TrieMatcher {
@@ -199,36 +300,44 @@ impl Trie {
     }
 }
 
+impl<S> FromIterator<S> for Trie
+where
+    S: AsRef<str>,
+{
+    fn from_iter<T: IntoIterator<Item=S>>(iter: T) -> Self {
+        let mut trie = Trie::default();
+
+        for topic in iter.into_iter() {
+            trie.insert(topic.as_ref());
+        }
+
+        trie
+    }
+}
+
 struct InnerMatcher<'a> {
     first_level: bool,
     // Topic level iterator
     levels: Peekable<Split<'a, char>>,
     current_level: Option<&'a str>,
-    children: NodeIter<'a>,
-}
-
-struct ChildrenIter<'a>(Iter<'a, (Word, NodeType), Box<Node>>);
-
-enum NodeIter<'a> {
-    Leaf(Option<&'a Node>),
-    Branch(ChildrenIter<'a>),
+    children: ChildrenNodeMatcher<'a>,
 }
 
 pub struct TrieMatcher<'a> {
     starts_with_dollar: bool,
-    path: Vec<&'a Word>,
+    path: Vec<&'a OwnedWord>,
     stack: Vec<InnerMatcher<'a>>,
 }
 
 impl<'a> Iterator for TrieMatcher<'a> {
-    type Item = Vec<&'a Word>;
+    type Item = Vec<&'a OwnedWord>;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             // NOTE: If the children iterators are empty, we have reached the end of the trie
             let current = self.stack.last_mut()?;
 
-            let (_word, node) = if let Some(next) = current.children.next() {
+            let node = if let Some(next) = current.children.next() {
                 next
             } else {
                 // Has no more siblings
@@ -276,29 +385,31 @@ impl<'a> Iterator for TrieMatcher<'a> {
                 }
 
                 // Match branch, go deep
-                (Branch{word: word @ Word::Plus, .. }, Some(_), false) => {
+                (Branch{word: word @ Word::Plus, children }, Some(_), false) => {
                     let mut next_levels = current.levels.clone();
                     let next = next_levels.next();
+                    let end_of_topic = next_levels.peek().is_none();
                     self.path.push(word);
                     self.stack.push(InnerMatcher {
                         first_level: false,
                         levels: next_levels,
                         current_level: next,
-                        children: node.iter(),
+                        children: children.search_node(next.unwrap(), end_of_topic),
                     });
                 }
 
                 // NOTE: Matched the current level but need to CONTINUE to try the next level
-                (Branch{word: word @ Word::Regular(s), ..}, Some(curr_level), _) if s == curr_level => {
+                (Branch{word: word @ Word::Regular(s), children}, Some(curr_level), false) if s == curr_level => {
                     // TODO: save the current cursor
                     let mut next_levels = current.levels.clone();
                     let next = next_levels.next();
+                    let end_of_topic = next_levels.peek().is_none();
                     self.path.push(word);
                     self.stack.push(InnerMatcher {
                         first_level: false,
                         levels: next_levels,
                         current_level: next,
-                        children: node.iter(),
+                        children: children.search_node(next.unwrap(), end_of_topic),
                     });
                 }
 
