@@ -36,6 +36,7 @@ impl Copy for NodeType {}
 enum Node {
     Leaf{
         word: OwnedWord,
+        value: String,
     },
     Branch{
         word: OwnedWord,
@@ -220,7 +221,7 @@ impl Node {
 
     fn is_wildcard(&self) -> bool {
         match self {
-            Node::Leaf{word: Word::Plus | Word::Num} |
+            Node::Leaf{word: Word::Plus | Word::Num, ..} |
             Node::Branch{word: Word::Plus | Word::Num, ..} => true,
             _ => false,
         }
@@ -255,6 +256,7 @@ impl Trie {
                 } else {
                     Box::new(Node::Leaf {
                         word,
+                        value: topic.to_string(),
                     })
                 }
             });
@@ -330,7 +332,7 @@ pub struct TrieMatcher<'a> {
 }
 
 impl<'a> Iterator for TrieMatcher<'a> {
-    type Item = Vec<&'a OwnedWord>;
+    type Item = &'a str;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
@@ -362,26 +364,26 @@ impl<'a> Iterator for TrieMatcher<'a> {
 
                 // Plus wildcard match any word in this level
                 // NOTE: Matched
-                (Leaf{word: word @ Word::Plus}, Some(_), true) => {
-                    let mut result = self.path.clone();
-                    result.push(word);
-                    return Some(result);
+                (Leaf{word: Word::Plus, value}, Some(_), true) => {
+                    // let mut result = self.path.clone();
+                    // result.push(word);
+                    return Some(value.as_str());
                 }
 
                 // Number sign wildcard match any word in this level and all the following levels
                 // NOTE: Matched all the following levels
                 // WARN: Number sign wildcard must only be on the leaf node
-                (Leaf{word: word @ Word::Num}, _, _) => {
-                    let mut result = self.path.clone();
-                    result.push(word);
-                    return Some(result);
+                (Leaf{word: Word::Num, value}, _, _) => {
+                    // let mut result = self.path.clone();
+                    // result.push(word);
+                    return Some(value.as_str());
                 }
 
                 // NOTE: Matched regular word on the leaf node
-                (Leaf{word: word @ Word::Regular(s)}, Some(curr_level), true) if s == curr_level => {
-                    let mut result = self.path.clone();
-                    result.push(word);
-                    return Some(result);
+                (Leaf{word: Word::Regular(s), value}, Some(curr_level), true) if s == curr_level => {
+                    // let mut result = self.path.clone();
+                    // result.push(word);
+                    return Some(value.as_str());
                 }
 
                 // Match branch, go deep
@@ -437,7 +439,7 @@ mod tests {
 
         assert_eq!(trie.len(), 3);
 
-        let mut result = trie.match_topic("aa/bb/cc").map(|m| m.join("/")).collect::<Vec<_>>();
+        let mut result = trie.match_topic("aa/bb/cc").collect::<Vec<_>>();
         result.sort();
         assert_eq!(result, vec!["#", "aa/+/cc", "aa/bb/cc"]);
     }
@@ -475,14 +477,14 @@ mod tests {
     fn plus() {
         let trie = Trie::from_iter(["aa/bb/cc", "cc/dd/ee", "aa/+/bb", "aa/+"].iter());
 
-        let mut matched = trie.match_topic("aa/bb").map(|m| m.join("/")).collect::<Vec<_>>();
+        let mut matched = trie.match_topic("aa/bb").collect::<Vec<_>>();
         matched.sort();
 
         assert_eq!(matched, vec!["aa/+"]);
 
         let trie = Trie::from_iter(["aa/bb/cc", "cc/dd/ee", "aa/+/bb", "aa/+"].iter());
 
-        let mut matched = trie.match_topic("aa/bb/bb").map(|m| m.join("/")).collect::<Vec<_>>();
+        let mut matched = trie.match_topic("aa/bb/bb").collect::<Vec<_>>();
         matched.sort();
 
         assert_eq!(matched, vec!["aa/+/bb"]);
