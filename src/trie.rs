@@ -8,7 +8,7 @@ const SINGLE_LEVEL_WILDCARD: &str = "+";
 const MULTI_LEVEL_WILDCARD: &str = "#";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum Word<T> {
+enum Level<T> {
     /// Single level wildcard
     Plus,
     /// Multi level wildcard
@@ -17,11 +17,11 @@ enum Word<T> {
     Regular(T),
 }
 
-type OwnedWord = Word<String>;
+type OwnedLevel = Level<String>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct OwnedKey {
-    word: OwnedWord,
+    value: OwnedLevel,
     node_type: NodeType,
 }
 
@@ -35,11 +35,12 @@ impl Copy for NodeType {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Node {
     Leaf{
-        word: OwnedWord,
-        value: String,
+        value: OwnedLevel,
+        /// The cached path associated with the leaf node.
+        path: String,
     },
     Branch{
-        word: OwnedWord,
+        value: OwnedLevel,
         children: Children,
     },
 }
@@ -55,24 +56,24 @@ pub struct Trie {
 struct Children(HashMap<OwnedKey, Box<Node>>);
 
 trait Key {
-    fn key(&self) -> (Word<&str>, NodeType);
+    fn key(&self) -> (Level<&str>, NodeType);
 }
 
 impl Key for OwnedKey {
-    fn key(&self) -> (Word<&str>, NodeType) {
-        (self.word.as_ref(), self.node_type)
+    fn key(&self) -> (Level<&str>, NodeType) {
+        (self.value.as_ref(), self.node_type)
     }
 }
 
-impl Key for (Word<&str>, NodeType) {
-    fn key(&self) -> (Word<&str>, NodeType) {
+impl Key for (Level<&str>, NodeType) {
+    fn key(&self) -> (Level<&str>, NodeType) {
         (self.0.clone(), self.1)
     }
 }
 
 impl Key for (&str, NodeType) {
-    fn key(&self) -> (Word<&str>, NodeType) {
-        (Word::Regular(self.0), self.1)
+    fn key(&self) -> (Level<&str>, NodeType) {
+        (Level::Regular(self.0), self.1)
     }
 }
 
@@ -95,9 +96,9 @@ impl<'a> std::hash::Hash for dyn Key + 'a {
     }
 }
 
-impl Word<String> {
-    fn as_ref(&self) -> Word<&str> {
-        use Word::*;
+impl Level<String> {
+    fn as_ref(&self) -> Level<&str> {
+        use Level::*;
         match self {
             Plus => Plus,
             Num => Num,
@@ -106,21 +107,21 @@ impl Word<String> {
     }
 }
 
-impl<T> From<T> for OwnedWord
+impl<T> From<T> for OwnedLevel
 where
     T: AsRef<str>,
 {
     fn from(src: T) -> Self {
         match src.as_ref() {
-            SINGLE_LEVEL_WILDCARD => Word::Plus,
-            MULTI_LEVEL_WILDCARD => Word::Num,
-            _ => Word::Regular(src.as_ref().to_string()),
+            SINGLE_LEVEL_WILDCARD => Level::Plus,
+            MULTI_LEVEL_WILDCARD => Level::Num,
+            _ => Level::Regular(src.as_ref().to_string()),
         }
     }
 }
 
 struct ChildrenNodeMatcher<'a> {
-    word: &'a str,
+    level: &'a str,
     end_of_topic: bool,
     children: &'a Children,
     search_type: NodeSearchType,
@@ -135,23 +136,28 @@ enum NodeSearchType {
     PlusLeaf,
     // search branch node of plus sign +
     PlusBranch,
-    // search leaf node of regular word
+    // search leaf node of regular value
     RegularLeaf,
-    // search branch node of regular word
+    // search branch node of regular value
     RegularBranch,
     // End of search
     End,
 }
 
 impl Children {
-    /// Search children nodes by word at the end of topic or at the middle level,
-    /// returns an iterator which may result in a number sign node wor pl1ug sign node.
-    fn search_node<'a, 'b>(&'a self, word: &'b str, end_of_topic: bool) -> ChildrenNodeMatcher<'b>
+    /// Search children nodes by topic level value at the end of topic or at the middle level,
+    /// returns an iterator which may result in a number sign node or plus sign node.
+    ///
+    /// We use HashMap as the children node container, so we only check 3 of them to
+    /// determine the match result.
+    ///
+    /// TODO: Validate the query parameter.
+    fn matches_nodes<'a, 'b>(&'a self, level: &'b str, end_of_topic: bool) -> ChildrenNodeMatcher<'b>
     where
         'a: 'b,
     {
         ChildrenNodeMatcher {
-            word,
+            level,
             end_of_topic,
             children: self,
             search_type: NodeSearchType::NumNode,
@@ -164,7 +170,7 @@ impl<'a> Iterator for ChildrenNodeMatcher<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         use NodeSearchType::*;
-        use Word::*;
+        use Level::*;
         use NodeType::*;
         let children = &self.children.0;
         loop {
@@ -180,7 +186,7 @@ impl<'a> Iterator for ChildrenNodeMatcher<'a> {
                     }
                     // NOTE: DON'T clone string, borrow it
                     RegularLeaf => {
-                        let key = (self.word, Leaf);
+                        let key = (self.level, Leaf);
                         (children.get(&key as &dyn Key), End)
                     }
                     _ => {
@@ -199,7 +205,7 @@ impl<'a> Iterator for ChildrenNodeMatcher<'a> {
                     }
                     // NOTE: DON'T clone string, borrow it
                     RegularBranch => {
-                        let key = (self.word, Branch);
+                        let key = (self.level, Branch);
                         (children.get(&key as &dyn Key), End)
                     }
                     _ => {
@@ -221,42 +227,46 @@ impl Node {
 
     fn is_wildcard(&self) -> bool {
         match self {
-            Node::Leaf{word: Word::Plus | Word::Num, ..} |
-            Node::Branch{word: Word::Plus | Word::Num, ..} => true,
+            Node::Leaf{value: Level::Plus | Level::Num, ..} |
+            Node::Branch{value: Level::Plus | Level::Num, ..} => true,
             _ => false,
         }
     }
 }
 
 impl Trie {
+    /// Construct a new empty trie.
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     /// Insert a MQTT `topic_filter` into the trie.
     pub fn insert(&mut self, topic_filter: &str) {
-        let mut words = topic_filter
+        let mut values = topic_filter
             .split(DELIMITER)
-            .map(|s| Word::from(s))
+            .map(|s| Level::from(s))
             .peekable();
 
         let mut current = &mut self.root;
 
-        while let Some(word) = words.next() {
-            let is_branch = words.peek().is_some();
+        while let Some(value) = values.next() {
+            let is_branch = values.peek().is_some();
             let node_type = if is_branch { NodeType::Branch } else { NodeType::Leaf };
             let key = OwnedKey {
-                word: word.clone(),
+                value: value.clone(),
                 node_type,
             };
 
             let child = current.0.entry(key).or_insert_with(|| {
                 if is_branch {
                     Box::new(Node::Branch {
-                        word,
+                        value,
                         children: Default::default(),
                     })
                 } else {
                     Box::new(Node::Leaf {
-                        word,
-                        value: topic_filter.to_string(),
+                        value,
+                        path: topic_filter.to_string(),
                     })
                 }
             });
@@ -280,7 +290,7 @@ impl Trie {
     }
 
     /// Find all matched MQTT Topic Filters in the trie to the given `topic`.
-    pub fn match_topic<'a, 'b>(&'a self, topic: &'b str) -> TrieMatcher<'b>
+    pub fn matches_topic<'a, 'b>(&'a self, topic: &'b str) -> TrieMatcher<'b>
     where
         'a: 'b,
     {
@@ -292,7 +302,8 @@ impl Trie {
             first_level: true,
             levels,
             current_level: current_level.clone(),
-            children: self.root.search_node(current_level.unwrap(), end_of_topic),
+            // Since the str split iterator always has at least one element, it's safe to unwrap.
+            children: self.root.matches_nodes(current_level.unwrap(), end_of_topic),
         };
 
         TrieMatcher {
@@ -307,11 +318,14 @@ impl<S> FromIterator<S> for Trie
 where
     S: AsRef<str>,
 {
-    fn from_iter<T: IntoIterator<Item=S>>(iter: T) -> Self {
+    /// Construct a `Trie` from an iterator over `&str`.
+    ///
+    /// TODO: It's better to validate the topic filter before insert it into the trie.
+    fn from_iter<T: IntoIterator<Item=S>>(topic_filters: T) -> Self {
         let mut trie = Trie::default();
 
-        for topic in iter.into_iter() {
-            trie.insert(topic.as_ref());
+        for topic_filter in topic_filters.into_iter() {
+            trie.insert(topic_filter.as_ref());
         }
 
         trie
@@ -326,10 +340,10 @@ struct InnerMatcher<'a> {
     children: ChildrenNodeMatcher<'a>,
 }
 
-/// An iterator over the matched topic filters in the [`Trie`] via [`Trie::match_topic`].
+/// An iterator over the matched topic filters in the [`Trie`] via [`Trie::matches_topic`].
 pub struct TrieMatcher<'a> {
     starts_with_dollar: bool,
-    path: Vec<&'a OwnedWord>,
+    path: Vec<&'a OwnedLevel>,
     stack: Vec<InnerMatcher<'a>>,
 }
 
@@ -358,66 +372,62 @@ impl<'a> Iterator for TrieMatcher<'a> {
 
                 // Not match
                 //
-                // NOTE:According to the MQTT spec, the topic starts with a $ is a system topic,
+                // NOTE: According to the MQTT spec, the topic starts with a $ is a system topic,
                 // and MUST NOT be matched Topic Filters starting with a wildcard character (# or +).
                 //
                 // See http://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html#_Toc398718108
                 (node, _, _) if current.first_level && node.is_wildcard() && self.starts_with_dollar => { }
 
-                // Plus wildcard match any word in this level
+                // Plus wildcard match any value in this level
                 // NOTE: Matched
-                (Leaf{word: Word::Plus, value}, Some(_), true) => {
-                    // let mut result = self.path.clone();
-                    // result.push(word);
-                    return Some(value.as_str());
+                (Leaf{value: Level::Plus, path}, Some(_), true) => {
+                    return Some(path.as_str());
                 }
 
-                // Number sign wildcard match any word in this level and all the following levels
+                // Number sign wildcard match any value in this level and all the following levels
                 // NOTE: Matched all the following levels
                 // WARN: Number sign wildcard must only be on the leaf node
-                (Leaf{word: Word::Num, value}, _, _) => {
-                    // let mut result = self.path.clone();
-                    // result.push(word);
-                    return Some(value.as_str());
+                (Leaf{value: Level::Num, path}, _, _) => {
+                    return Some(path.as_str());
                 }
 
-                // NOTE: Matched regular word on the leaf node
-                (Leaf{word: Word::Regular(s), value}, Some(curr_level), true) if s == curr_level => {
-                    // let mut result = self.path.clone();
-                    // result.push(word);
-                    return Some(value.as_str());
+                // NOTE: Matched regular value on the leaf node
+                (Leaf{value: Level::Regular(s), path}, Some(curr_level), true) if s == curr_level => {
+                    return Some(path.as_str());
                 }
 
                 // Match branch, go deep
-                (Branch{word: word @ Word::Plus, children }, Some(_), false) => {
+                (Branch{value: value @ Level::Plus, children}, Some(_), false) => {
                     let mut next_levels = current.levels.clone();
                     let next = next_levels.next();
                     let end_of_topic = next_levels.peek().is_none();
-                    self.path.push(word);
+                    self.path.push(value);
                     self.stack.push(InnerMatcher {
                         first_level: false,
                         levels: next_levels,
                         current_level: next,
-                        children: children.search_node(next.unwrap(), end_of_topic),
+                        // Since current level is not at the end of the topic, it's safe to unwrap
+                        children: children.matches_nodes(next.unwrap(), end_of_topic),
                     });
                 }
 
                 // NOTE: Matched the current level but need to CONTINUE to try the next level
-                (Branch{word: word @ Word::Regular(s), children}, Some(curr_level), false) if s == curr_level => {
-                    // TODO: save the current cursor
+                (Branch{value: value @ Level::Regular(s), children}, Some(curr_level), false) if s == curr_level => {
+                    // NOTE: save the current cursor
                     let mut next_levels = current.levels.clone();
                     let next = next_levels.next();
                     let end_of_topic = next_levels.peek().is_none();
-                    self.path.push(word);
+                    self.path.push(value);
                     self.stack.push(InnerMatcher {
                         first_level: false,
                         levels: next_levels,
                         current_level: next,
-                        children: children.search_node(next.unwrap(), end_of_topic),
+                        // Since current level is not at the end of the topic, it's safe to unwrap
+                        children: children.matches_nodes(next.unwrap(), end_of_topic),
                     });
                 }
 
-                (Branch{word: Word::Num, ..}, _, _) => {
+                (Branch{value: Level::Num, ..}, _, _) => {
                     unreachable!("Number sign wildcard must only be on the leaf node");
                 }
 
@@ -441,9 +451,20 @@ mod tests {
 
         assert_eq!(trie.len(), 3);
 
-        let mut result = trie.match_topic("aa/bb/cc").collect::<Vec<_>>();
+        let mut result = trie.matches_topic("aa/bb/cc").collect::<Vec<_>>();
         result.sort();
         assert_eq!(result, vec!["#", "aa/+/cc", "aa/bb/cc"]);
+        assert!(trie.matches_topic("$SYS/foo").collect::<Vec<_>>().is_empty());
+
+        let trie = Trie::from_iter(["aa/bb/cc", "#", "+/bb", "$SYS/#"].iter());
+        assert_eq!(trie.len(), 4);
+        assert_eq!(trie.matches_topic("$SYS/foo").collect::<Vec<_>>(), vec!["$SYS/#"]);
+
+        let trie = Trie::from_iter(["sport/+"].iter());
+        assert_eq!(trie.len(), 1);
+
+        assert!(trie.matches_topic("sport").collect::<Vec<_>>().is_empty());
+        assert_eq!(trie.matches_topic("sport/").collect::<Vec<_>>(), vec!["sport/+"]);
     }
 
     #[test]
@@ -471,7 +492,7 @@ mod tests {
         let trie = Trie::from_iter(["aa/bb/cc", "cc/dd/ee", "+/bb"].iter());
         assert_eq!(trie.len(), 3);
 
-        let matched = trie.match_topic("bb/cc/dd").collect::<Vec<_>>();
+        let matched = trie.matches_topic("bb/cc/dd").collect::<Vec<_>>();
         assert!(matched.is_empty());
     }
 
@@ -479,14 +500,14 @@ mod tests {
     fn plus() {
         let trie = Trie::from_iter(["aa/bb/cc", "cc/dd/ee", "aa/+/bb", "aa/+"].iter());
 
-        let mut matched = trie.match_topic("aa/bb").collect::<Vec<_>>();
+        let mut matched = trie.matches_topic("aa/bb").collect::<Vec<_>>();
         matched.sort();
 
         assert_eq!(matched, vec!["aa/+"]);
 
         let trie = Trie::from_iter(["aa/bb/cc", "cc/dd/ee", "aa/+/bb", "aa/+"].iter());
 
-        let mut matched = trie.match_topic("aa/bb/bb").collect::<Vec<_>>();
+        let mut matched = trie.matches_topic("aa/bb/bb").collect::<Vec<_>>();
         matched.sort();
 
         assert_eq!(matched, vec!["aa/+/bb"]);
